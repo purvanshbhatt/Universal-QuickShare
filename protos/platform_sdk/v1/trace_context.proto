@@ -1,0 +1,17 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+
+syntax = "proto3";
+package platform_sdk.v1;
+
+option csharp_namespace = "YourPhone.YPP.PlatformSdk.Protocol.V1";
+option java_package = "com.microsoft.mmx.agents.ypp.platformsdk.protocol.v1";
+option java_multiple_files = true;
+option optimize_for = SPEED;
+
+// Context used for telemetry 
+message ProtoTraceContext {
+  string trace_id = 1;
+  string parent_id = 2;
+  string correlation_id = 3;
+  map<string, string> trace_state = 4;
+}

@@ -1,0 +1,53 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+
+syntax = "proto3";
+package platform_sdk.v1;
+
+option csharp_namespace = "YourPhone.YPP.PlatformSdk.Protocol.V1";
+option java_package = "com.microsoft.mmx.agents.ypp.platformsdk.protocol.v1";
+option java_multiple_files = true;
+option optimize_for = SPEED;
+
+import "platform_sdk/v1/trace_context.proto";
+
+message ContextSourceMessage {
+  oneof type {
+    CSInitializeMessage cs_initialize_message = 1;
+    CSInitializeAckMessage cs_initialize_ack_message = 2;
+    CSOpenDeviceConnectionRequest cs_open_device_connection_request = 3;
+    CSConnectionInfo cs_connection_info = 8;
+    CSErrorInfo cs_error_info = 9;
+  }
+}
+
+message CSInitializeMessage {
+  string context_source_id = 2;
+  ProtoTraceContext trace_context = 4;
+}
+
+message CSInitializeAckMessage {
+  CSInitializeStatus status = 3;
+  ProtoTraceContext trace_context = 4;
+}
+
+message CSOpenDeviceConnectionRequest {
+  string scenario_id = 1;
+  ProtoTraceContext trace_context = 2;
+}
+
+message CSConnectionInfo {
+  string connection_info = 1;
+  ProtoTraceContext trace_context = 2;
+}
+
+message CSErrorInfo {
+  string context_source_error_type = 1;
+  ProtoTraceContext trace_context = 2;
+}
+
+enum CSInitializeStatus {
+  CS_INITIALIZE_STATUS_UNSPECIFIED = 0;
+  CS_INITIALIZE_STATUS_SUCCESS = 1;
+  CS_INITIALIZE_STATUS_ERROR = 2;
+  CS_INITIALIZE_STATUS_ERROR_DEVICE_CONNECTION_FAILURE = 3;
+}

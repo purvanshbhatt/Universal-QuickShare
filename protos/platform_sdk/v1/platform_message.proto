@@ -1,0 +1,24 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+
+syntax = "proto3";
+package platform_sdk.v1;
+
+option csharp_namespace = "YourPhone.YPP.PlatformSdk.Protocol.V1";
+option java_package = "com.microsoft.mmx.agents.ypp.platformsdk.protocol.v1";
+option java_multiple_files = true;
+option optimize_for = SPEED;
+
+import "platform_sdk/v1/trace_context.proto";
+
+message PlatformDisconnectRequest {
+  ProtoTraceContext trace_context = 1;
+  PlatformDisconnectRequestReason reason = 2;
+}
+
+enum PlatformDisconnectRequestReason {
+	PLATFORM_DISCONNECT_REQUEST_REASON_UNSPECIFIED = 0;
+	PLATFORM_DISCONNECT_REQUEST_REASON_USER_REQUESTED = 1;
+	PLATFORM_DISCONNECT_REQUEST_REASON_ALL_SYNC_DISABLED = 2;
+	PLATFORM_DISCONNECT_REQUEST_REASON_METERED_SYNC_DISABLED = 3;
+	PLATFORM_DISCONNECT_REQUEST_REASON_ACTIVE_SESSION_REPLACED = 4;
+}

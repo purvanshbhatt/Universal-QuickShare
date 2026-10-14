@@ -1,0 +1,51 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+
+syntax = "proto3";
+package platform_sdk.v1;
+
+option csharp_namespace = "YourPhone.YPP.PlatformSdk.Protocol.V1";
+option java_package = "com.microsoft.mmx.agents.ypp.platformsdk.protocol.v1";
+option java_multiple_files = true;
+option optimize_for = SPEED;
+
+import "platform_sdk/v1/trace_context.proto";
+
+// Common message header. Contains meta data for request & reply
+enum ProtoPlatformChannelType {
+	PROTO_PLATFORM_CHANNEL_TYPE_UNSPECIFIED = 0;
+	PROTO_PLATFORM_CHANNEL_TYPE_NAMED_STREAMS_CHANNEL = 1;
+	PROTO_PLATFORM_CHANNEL_TYPE_VIDEO_STREAMING_CHANNEL = 2;
+}
+
+enum ProtoCreatePlatformChannelStatus {
+	PROTO_CREATE_PLATFORM_CHANNEL_STATUS_UNSPECIFIED = 0;
+	PROTO_CREATE_PLATFORM_CHANNEL_STATUS_SUCCESS = 1;
+	PROTO_CREATE_PLATFORM_CHANNEL_STATUS_FAILURE = 2;
+	PROTO_CREATE_PLATFORM_CHANNEL_STATUS_NO_REMOTE_SCENARIO_AVAILABLE = 3;
+	PROTO_CREATE_PLATFORM_CHANNEL_STATUS_REMOTE_SCENARIO_REJECTED_CHANNEL = 4;
+}
+enum ChannelAcceptanceStatus {
+	CHANNEL_ACCEPTANCE_STATUS_UNSPECIFIED = 0;
+	CHANNEL_ACCEPTANCE_STATUS_SUCCESS = 1;
+	CHANNEL_ACCEPTANCE_STATUS_PERMISSION_REVOKED = 2;
+	CHANNEL_ACCEPTANCE_STATUS_APP_DISABLED = 3;
+	CHANNEL_ACCEPTANCE_STATUS_MOBILE_DATA_DISABLED = 4;
+	CHANNEL_ACCEPTANCE_STATUS_NOT_SUPPORTED = 5;
+	CHANNEL_ACCEPTANCE_STATUS_INVALID_SCENARIO = 6;
+	CHANNEL_ACCEPTANCE_STATUS_NO_CALLBACK_PROVIDED = 7;
+}
+
+message ProtoCreatePlatformChannelRequest {
+  ProtoPlatformChannelType type = 1;
+  string scenario_id = 2;
+  string channel_id = 3;
+  ProtoTraceContext trace_context = 4;
+}
+
+message ProtoPeerPlatformChannelCreationResult {
+	ProtoPlatformChannelType type = 1;
+	string scenario_id = 2;
+	ProtoCreatePlatformChannelStatus result_code = 3;
+	ProtoTraceContext trace_context = 4;
+	ChannelAcceptanceStatus result_reason = 5;
+}

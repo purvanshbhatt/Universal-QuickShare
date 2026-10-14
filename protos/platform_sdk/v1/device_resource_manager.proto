@@ -1,0 +1,51 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+
+syntax = "proto3";
+package platform_sdk.v1;
+
+option csharp_namespace = "YourPhone.YPP.PlatformSdk.Protocol.V1";
+option java_package = "com.microsoft.mmx.agents.ypp.platformsdk.protocol.v1";
+option java_multiple_files = true;
+option optimize_for = SPEED;
+
+// Deprecated, please use resource_uri
+enum ProtoDeviceResourceType
+{
+    PROTO_DEVICE_RESOURCE_TYPE_UNSPECIFIED = 0;
+    PROTO_DEVICE_RESOURCE_TYPE_FILES_METADATA = 1;
+    PROTO_DEVICE_RESOURCE_TYPE_CAMERA_METADATA = 2;
+    PROTO_DEVICE_RESOURCE_TYPE_PERMISSIONS = 3;
+    PROTO_DEVICE_RESOURCE_TYPE_UNKNOWN = 4;
+	PROTO_DEVICE_RESOURCE_TYPE_WALLPAPER = 5;
+	PROTO_DEVICE_RESOURCE_TYPE_MEDIA = 6;
+	PROTO_DEVICE_RESOURCE_TYPE_RING_MY_PHONE = 7;
+	PROTO_DEVICE_RESOURCE_TYPE_LOCK_MY_PC = 8;
+	PROTO_DEVICE_RESOURCE_TYPE_FILE_SHARE = 9;
+}
+
+enum ProtoDeviceResourceRequestType
+{
+	PROTO_DEVICE_RESOURCE_REQUEST_TYPE_UNSPECIFIED = 0;
+	PROTO_DEVICE_RESOURCE_REQUEST_TYPE_GET = 1;
+	PROTO_DEVICE_RESOURCE_REQUEST_TYPE_UPDATE = 2;
+	PROTO_DEVICE_RESOURCE_REQUEST_TYPE_DELETE = 3;
+	PROTO_DEVICE_RESOURCE_REQUEST_TYPE_SYNC = 4;
+}
+
+message DeviceResourceManagerMessage {
+	ProtoDeviceResourceType resource_type = 1;
+	ProtoDeviceResourceRequestType request_type = 2;
+	bytes payload = 3;
+	string resource_path = 4;
+}
+
+enum DeviceResourceManagerResponseMessageType {
+	DEVICE_RESOURCE_MANAGER_RESPONSE_MESSAGE_TYPE_UNSPECIFIED = 0;
+	DEVICE_RESOURCE_MANAGER_RESPONSE_MESSAGE_TYPE_SUCCESS = 1;
+	DEVICE_RESOURCE_MANAGER_RESPONSE_MESSAGE_TYPE_RESOURCE_HANDLER_NOT_REGISTERED = 2;
+}
+
+message DeviceResourceManagerResponseMessage {
+	bytes payload = 1;
+	optional DeviceResourceManagerResponseMessageType response_type = 2;
+}

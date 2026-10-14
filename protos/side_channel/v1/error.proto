@@ -1,0 +1,25 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+
+syntax = "proto3";
+package side_channel.v1;
+
+option csharp_namespace = "YourPhone.YPP.SideChannel.Protocol.V1";
+option java_package = "com.microsoft.mmx.agents.ypp.sidechannel.protocol.v1";
+option java_multiple_files = true;
+option optimize_for = SPEED;
+
+enum SideChannelErrorType {
+    SIDE_CHANNEL_ERROR_TYPE_UNSPECIFIED = 0;
+    SIDE_CHANNEL_ERROR_TYPE_OTHER_SERVER_ERROR = 1;
+    SIDE_CHANNEL_ERROR_TYPE_UNKNOWN_REQUEST_TYPE = 2;
+    SIDE_CHANNEL_ERROR_TYPE_SCENARIO_SERVICE_ERROR = 3;
+    SIDE_CHANNEL_ERROR_TYPE_CRYPTO_VALIDATION_ERROR = 4;
+    SIDE_CHANNEL_ERROR_TYPE_CLIENT_INFO_MISSING = 5;
+    SIDE_CHANNEL_ERROR_TYPE_CRYPTO_TRUST_ERROR = 6;
+    SIDE_CHANNEL_ERROR_TYPE_CRYPTO_TRUST_TIMEOUT = 7;
+}
+
+message SideChannelError {
+    SideChannelErrorType type = 1;
+    string msg = 2;
+}

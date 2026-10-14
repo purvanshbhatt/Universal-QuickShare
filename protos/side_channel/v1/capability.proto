@@ -1,0 +1,23 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+
+syntax = "proto3";
+package side_channel.v1;
+
+option csharp_namespace = "YourPhone.YPP.SideChannel.Protocol.V1";
+option java_package = "com.microsoft.mmx.agents.ypp.sidechannel.protocol.v1";
+option java_multiple_files = true;
+option optimize_for = SPEED;
+
+enum SideChannelCapability {
+    SIDE_CHANNEL_CAPABILITY_UNSPECIFIED = 0; // None
+    SIDE_CHANNEL_CAPABILITY_WAKE = 1;
+    SIDE_CHANNEL_CAPABILITY_HOTSPOT = 2;
+}
+
+message SideChannelCapabilityRequest {
+    // Nothing
+}
+
+message SideChannelCapabilityResponse {
+    repeated SideChannelCapability capabilities = 1;  
+}

@@ -1,0 +1,49 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+
+syntax = "proto3";
+package side_channel.v1;
+
+option csharp_namespace = "YourPhone.YPP.SideChannel.Protocol.V1";
+option java_package = "com.microsoft.mmx.agents.ypp.sidechannel.protocol.v1";
+option java_multiple_files = true;
+option optimize_for = SPEED;
+
+import "side_channel/v1/error.proto";
+import "side_channel/v1/trace_context.proto";
+import "side_channel/v1/wake.proto";
+import "side_channel/v1/capability.proto";
+import "side_channel/v1/authorization.proto";
+import "side_channel/v1/hotspot.proto";
+
+message SideChannelClientRequest {
+    SideChannelTraceContext context = 1;
+
+    oneof request {
+        SideChannelWakeRequest wake_request = 2;
+        SideChannelCapabilityRequest capability_request = 3;
+        SideChannelHotspotRequest hotspot_request = 5;
+    }
+
+    optional SideChannelAuthorization authorization = 4;
+}
+
+message SideChannelServerResponse {
+    bool ok = 1;
+    SideChannelError error = 2;
+    
+    oneof response {
+        SideChannelWakeResponse wake_response = 3;
+        SideChannelCapabilityResponse capability_response = 4;
+        SideChannelHotspotResponse hotspot_response = 5;
+    }
+
+    optional SideChannelAuthorization authorization = 6;
+    SideChannelTraceContext context = 7;
+}
+
+message SideChannelServerMessage {
+    oneof body {
+        SideChannelServerResponse request_response = 1;
+        // Other types in the future go here e.g. announcement messages
+    }
+}

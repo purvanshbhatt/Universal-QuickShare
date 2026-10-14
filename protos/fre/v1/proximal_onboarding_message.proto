@@ -1,0 +1,14 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+
+syntax = "proto3";
+package fre.v1;
+
+option csharp_namespace = "YourPhone.Fre.Protocol.V1";
+option java_package = "com.microsoft.appmanager.proximal";
+option java_multiple_files = true;
+option optimize_for = SPEED;
+
+// Context used for telemetry 
+message ProximalOnboardingMessage {
+  string device_name = 1;
+}

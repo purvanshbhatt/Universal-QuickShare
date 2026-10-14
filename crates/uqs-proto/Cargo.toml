@@ -1,0 +1,13 @@
+[package]
+name = "uqs-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+
+[build-dependencies]
+prost-build = "0.13"
+protox = "0.7"

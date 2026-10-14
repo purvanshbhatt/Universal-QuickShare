@@ -1,0 +1,119 @@
+syntax = "proto3";
+
+package pbvalueset;
+
+option java_outer_classname = "PBValueSet";
+option java_package = "com.microsoft.mmx.agents";
+option optimize_for = LITE_RUNTIME;
+
+enum DataValueType {
+    DataValueType_Invalid = 0;
+    DataValueType_UInt8 = 1;
+    DataValueType_Int16 = 2;
+    DataValueType_UInt16 = 3;
+    DataValueType_Int32 = 4;
+    DataValueType_UInt32 = 5;
+    DataValueType_Int64 = 6;
+    DataValueType_UInt64 = 7;
+    DataValueType_Single = 8;
+    DataValueType_Double = 9;
+    DataValueType_Char16 = 10;
+    DataValueType_Bool = 11;
+    DataValueType_String = 12;
+    DataValueType_Guid = 13;
+    DataValueType_Point = 14;
+    DataValueType_Size = 15;
+    DataValueType_Rect = 16;
+    DataValueType_Object = 17;
+    DataValueType_UInt8Array = 18;
+    DataValueType_Int16Array = 19;
+    DataValueType_UInt16Array = 20;
+    DataValueType_Int32Array = 21;
+    DataValueType_UInt32Array = 22;
+    DataValueType_Int64Array = 23;
+    DataValueType_UInt64Array = 24;
+    DataValueType_SingleArray = 25;
+    DataValueType_DoubleArray = 26;
+    DataValueType_Char16Array = 27;
+    DataValueType_BoolArray = 28;
+    DataValueType_StringArray = 29;
+    DataValueType_GuidArray = 30;
+    DataValueType_PointArray = 31;
+    DataValueType_SizeArray = 32;
+    DataValueType_RectArray = 33;
+    DataValueType_ObjectArray = 34;
+    DataValueType_Empty = 35;
+    DataValueType_DateTime = 36;
+    DataValueType_TimeSpan = 37;
+    DataValueType_DateTimeArray = 38;
+    DataValueType_TimeSpanArray = 39;
+}
+
+// Schema with similar memory layout as WinRT Windows.Foundation.Point
+message Point {
+    float X = 1;
+    float Y = 2;
+}
+
+// Schema with similar memory layout as WinRT Windows.Foundation.Size
+message Size {
+    float Width = 1;
+    float Height = 2;
+}
+
+// Schema with similar memory layout as WinRT Windows.Foundation.Rect
+message Rect {
+    float X = 1;
+    float Y = 2;
+    float Width = 3;
+    float Height = 4;
+}
+
+message DataVariant {
+    // "Required" field. Default INVALID as the default value is the first defined enum value
+    DataValueType value_type = 1;
+    // "Optional" values, one of them will be set depending on value_type
+    int32 uint8_value = 2; // uint8
+    int32 int16_value = 3; // int16
+    int32 uint16_value = 4; // uint16
+    int32 int32_value = 5;
+    uint32 uint32_value = 6;
+    int64 int64_value = 7;
+    uint64 uint64_value = 8;
+    float single_value = 9;
+    double double_value = 10;
+    uint32 char16_value = 11; // uint16
+    bool bool_value = 12;
+    string string_value = 13;
+    string guid_value = 14; 
+    Point point_value = 15;
+    Size size_value = 16;
+    Rect rect_value = 17;
+    ValueSet object_value = 18;
+    int64 datetime_value = 19;
+    int64 timespan_value = 20;
+    bytes uint8_array = 21;
+    repeated int32 int16_array = 22;
+    repeated int32 uint16_array = 23;
+    repeated int32 int32_array = 24;
+    repeated uint32 uint32_array = 25;
+    repeated int64 int64_array = 26;
+    repeated uint64 uint64_array = 27;
+    repeated float single_array = 28;
+    repeated double double_array = 29;
+    repeated uint32 char16_array = 30;
+    repeated bool bool_array = 31;
+    repeated string string_array = 32;
+    repeated string guid_array = 33; 
+    repeated Point point_array = 34;
+    repeated Size size_array = 35;
+    repeated Rect rect_array = 36;
+    repeated ValueSet object_array = 37;
+    repeated int64 datetime_array = 38;
+    repeated int64 timespan_array = 39;
+}
+
+// Schema similar to WinRT ValueSet
+message ValueSet {
+    map<string, DataVariant> entries = 1;
+}

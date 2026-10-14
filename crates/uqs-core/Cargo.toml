@@ -1,0 +1,29 @@
+[package]
+name = "uqs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+uqs-proto = { path = "../uqs-proto" }
+prost.workspace = true
+prost-types.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+base64.workspace = true
+hex.workspace = true
+rand.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+aes.workspace = true
+aes-gcm.workspace = true
+cbc.workspace = true
+p256.workspace = true
+mdns-sd.workspace = true
+zbus.workspace = true
+qrcode.workspace = true
+serde.workspace = true
+serde_json.workspace = true

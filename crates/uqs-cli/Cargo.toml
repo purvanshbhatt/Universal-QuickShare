@@ -1,0 +1,23 @@
+[package]
+name = "uqs-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "uqs"
+path = "src/main.rs"
+
+[dependencies]
+uqs-proto = { path = "../uqs-proto" }
+uqs-core = { path = "../uqs-core" }
+uqs-airdrop = { path = "../uqs-airdrop" }
+uqs-phonelink = { path = "../uqs-phonelink" }
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+notify-rust.workspace = true
+serde.workspace = true
+serde_json.workspace = true

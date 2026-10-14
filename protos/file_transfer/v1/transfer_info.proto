@@ -1,0 +1,37 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+
+syntax = "proto3";
+
+package file_transfer.v1;
+
+option csharp_namespace = "YourPhone.SharedContent.Protocol.V1";
+option java_package = "com.microsoft.mmx.agents.filetransfer.protocol.v1";
+option java_multiple_files = true;
+option optimize_for = SPEED;
+
+message FileShareContentMessage {
+  string file_id = 1;    // @SerializedName("FileId")
+  string file_name = 2;  // @SerializedName("FileName")
+  int64 file_size = 3;   // @SerializedName("FileSize")
+  string file_hash = 4;  // @SerializedName("FileHash")
+  FileShareFileStatus file_status = 5;  // @SerializedName("FileStatus")
+}
+
+message FileShareMessage {
+  string transfer_id = 1;    // @SerializedName("TransferId")
+  string scenario = 2;      // @SerializedName("Scenario")
+  string sender_name = 3;    // @SerializedName("SenderName")
+  int32 received_file_count = 4; // @SerializedName("ReceivedFileCount")
+  repeated FileShareContentMessage content = 5; // @SerializedName("Content")
+  string pc_folder = 6;      // @SerializedName("PcFolder")
+  // Number of times the session has been tried
+  int32 session_try_count = 7;  // @SerializedName("SessionTryCount")
+  bool is_concurrent_mode = 8;  // @SerializedName("IsConcurrentMode")
+}
+
+enum FileShareFileStatus {
+  FILE_SHARE_FILE_STATUS_UNSPECIFIED = 0;
+  FILE_SHARE_FILE_STATUS_NOT_STARTED = 1;
+  FILE_SHARE_FILE_STATUS_IN_PROGRESS = 2;
+  FILE_SHARE_FILE_STATUS_COMPLETED = 3;
+}

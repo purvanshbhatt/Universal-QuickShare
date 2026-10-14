@@ -1,0 +1,32 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+
+syntax = "proto3";
+package file_transfer.v1;
+
+option csharp_namespace = "YourPhone.SharedContent.Protocol.V1";
+option java_package = "com.microsoft.mmx.agents.filetransfer.protocol.v1";
+option java_multiple_files = true;
+option optimize_for = SPEED;
+
+enum FileTransferRequestType {
+  FILE_TRANSFER_REQUEST_TYPE_UNSPECIFIED = 0;
+  FILE_TRANSFER_REQUEST_TYPE_PERMISSION = 1;
+}
+
+enum FileTransferResponseStatus {
+  FILE_TRANSFER_RESPONSE_STATUS_UNSPECIFIED = 0;
+  FILE_TRANSFER_RESPONSE_STATUS_OK = 1;
+  FILE_TRANSFER_RESPONSE_STATUS_FEATURE_NOT_SUPPORT = 2;
+  FILE_TRANSFER_RESPONSE_STATUS_INVALID_DEVICE_RESOURCE_REQUEST_TYPE = 3;
+  FILE_TRANSFER_RESPONSE_STATUS_UNRECOGNIZED_PAYLOAD = 4;
+  FILE_TRANSFER_RESPONSE_STATUS_INVALID_FILE_TRANSFER_REQUEST_TYPE = 5;
+  FILE_TRANSFER_RESPONSE_STATUS_MISSING_PERMISSION = 6;
+}
+
+message FileTransferRequestMessage {
+  FileTransferRequestType request_type = 1;
+}
+
+message FileTransferResponseMessage {
+  FileTransferResponseStatus status = 1;
+}
