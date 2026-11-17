@@ -124,7 +124,10 @@ mod tests {
     #[tokio::test]
     async fn end_to_end_tcp_file_transfer_roundtrip() {
         use tokio::net::TcpListener;
-        use crate::transfer::{handle_incoming_connection, send_files_to_peer, ReceivedItem};
+        use crate::transfer::{
+            handle_incoming_connection, send_items_to_peer, OutgoingItem, OutgoingTextKind,
+            ReceivedItem,
+        };
 
         let tmp_root = std::env::temp_dir().join(format!("uqs_test_{}", std::process::id()));
         let src_dir = tmp_root.join("src");
@@ -142,11 +145,15 @@ mod tests {
         let dst_dir_clone = dst_dir.clone();
         let receiver_task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            handle_incoming_connection(&mut stream, &dst_dir_clone, |offer| {
+            handle_incoming_connection(&mut stream, &dst_dir_clone, |offer| async move {
                 assert_eq!(offer.peer_name, "Linux-Sender");
                 assert_eq!(offer.files.len(), 1);
                 assert_eq!(offer.files[0].name, "sample_payload.bin");
                 assert_eq!(offer.files[0].size, 150_000);
+                assert_eq!(offer.texts.len(), 1);
+                assert_eq!(offer.texts[0].title, "https://example.com/hello");
+                // Simulate a slow human: the sender must survive this wait.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 true
             })
             .await
@@ -156,11 +163,13 @@ mod tests {
         let qr = QuickShareQrCode::generate();
         let sender_file = src_file.clone();
         let sender_task = tokio::spawn(async move {
-            send_files_to_peer(
+            let link = OutgoingItem::text("https://example.com/hello");
+            assert!(matches!(link, OutgoingItem::Text { kind: OutgoingTextKind::Url, .. }));
+            send_items_to_peer(
                 addr,
                 "Linux-Sender",
                 b"SND1",
-                &[sender_file],
+                &[OutgoingItem::File(sender_file), link],
                 Some(|auth: &[u8]| qr.sign_auth_string(auth)),
                 |pin| assert_eq!(pin.len(), 4),
             )
@@ -168,18 +177,30 @@ mod tests {
             .unwrap();
         });
 
-        let (received, _) = tokio::join!(receiver_task, sender_task);
+        let (received, sent) = tokio::join!(receiver_task, sender_task);
+        sent.unwrap();
         let items = received.unwrap();
-        assert_eq!(items.len(), 1);
-        match &items[0] {
-            ReceivedItem::File { name, path, size } => {
-                assert_eq!(name, "sample_payload.bin");
-                assert_eq!(*size, 150_000);
-                let disk_bytes = tokio::fs::read(path).await.unwrap();
-                assert_eq!(disk_bytes, payload_data);
+        assert_eq!(items.len(), 2);
+        let mut saw_file = false;
+        let mut saw_text = false;
+        for item in &items {
+            match item {
+                ReceivedItem::File { name, path, size } => {
+                    assert_eq!(name, "sample_payload.bin");
+                    assert_eq!(*size, 150_000);
+                    let disk_bytes = tokio::fs::read(path).await.unwrap();
+                    assert_eq!(disk_bytes, payload_data);
+                    saw_file = true;
+                }
+                ReceivedItem::Text { title, body } => {
+                    assert_eq!(title, "https://example.com/hello");
+                    assert_eq!(body, "https://example.com/hello");
+                    saw_text = true;
+                }
+                other => panic!("unexpected received item: {other:?}"),
             }
-            other => panic!("unexpected received item: {other:?}"),
         }
+        assert!(saw_file && saw_text);
 
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -222,20 +222,106 @@ pub fn parse_endpoint_info(endpoint_info: &[u8]) -> Result<ParsedAdvertisement, 
     })
 }
 
-/// Probe outbound route to find the host's primary non-loopback LAN IPv4 address.
-pub fn pick_ipv4_address() -> Result<Ipv4Addr, MdnsError> {
-    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
-        if sock.connect("8.8.8.8:80").is_ok() {
-            if let Ok(local_addr) = sock.local_addr() {
-                if let IpAddr::V4(ipv4) = local_addr.ip() {
-                    if !ipv4.is_loopback() && !ipv4.is_unspecified() {
-                        return Ok(ipv4);
-                    }
-                }
-            }
-        }
+/// A physical-ish network interface with an IPv4 address (Wi-Fi, Ethernet, USB tether).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanInterface {
+    pub name: String,
+    pub addr: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+}
+
+impl LanInterface {
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        let m = u32::from(self.netmask);
+        (u32::from(self.addr) & m) == (u32::from(ip) & m)
     }
-    Err(MdnsError::NoIpv4Address)
+}
+
+/// Interface names that never carry a phone: container bridges, VPN tunnels, VM NICs.
+/// Advertising their addresses makes Android pick an unreachable A record and silently
+/// drop the receiver from the share sheet.
+pub fn is_virtual_interface(name: &str) -> bool {
+    const PREFIXES: [&str; 14] = [
+        "lo", "docker", "br-", "veth", "virbr", "tun", "tap", "wg", "vmnet", "vbox", "zt", "tailscale",
+        "nordlynx", "nordtun",
+    ];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Every interface with a usable IPv4 (non-loopback, not virtual), default-route one first.
+pub fn lan_interfaces() -> Vec<LanInterface> {
+    let mut out: Vec<LanInterface> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| !is_virtual_interface(&i.name))
+        .filter_map(|i| match i.addr {
+            if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() && !v4.ip.is_link_local() => Some(LanInterface {
+                name: i.name,
+                addr: v4.ip,
+                netmask: v4.netmask,
+            }),
+            _ => None,
+        })
+        .collect();
+    if let Some(primary) = route_ipv4_address() {
+        out.sort_by_key(|i| i.addr != primary);
+    }
+    out
+}
+
+/// Names of all interfaces that should be excluded from mDNS traffic.
+fn virtual_interface_names() -> Vec<String> {
+    let mut names: Vec<String> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|i| i.name)
+        .filter(|n| is_virtual_interface(n))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Keep mDNS off container bridges / VPN tunnels so announcements and queries only
+/// travel on links a phone can be on.
+fn restrict_daemon_to_lan(daemon: &ServiceDaemon) {
+    for name in virtual_interface_names() {
+        let _ = daemon.disable_interface(IfKind::Name(name));
+    }
+}
+
+/// Source address of the default route (the interface that reaches the internet), if any.
+fn route_ipv4_address() -> Option<Ipv4Addr> {
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    match sock.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
+}
+
+/// The host's primary LAN IPv4: the default-route interface, else the first real one.
+pub fn pick_ipv4_address() -> Result<Ipv4Addr, MdnsError> {
+    if let Some(ip) = route_ipv4_address() {
+        return Ok(ip);
+    }
+    lan_interfaces().first().map(|i| i.addr).ok_or(MdnsError::NoIpv4Address)
+}
+
+/// Among a peer's addresses, prefer one on a subnet we are actually attached to.
+pub fn prefer_reachable(addrs: impl IntoIterator<Item = Ipv4Addr>) -> Option<Ipv4Addr> {
+    let ours = lan_interfaces();
+    let mut fallback = None;
+    for ip in addrs {
+        if ip.is_loopback() {
+            continue;
+        }
+        if ours.iter().any(|i| i.contains(ip)) {
+            return Some(ip);
+        }
+        fallback.get_or_insert(ip);
+    }
+    fallback
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,7 +329,10 @@ pub struct DiscoveredDevice {
     pub endpoint_id: String,
     pub device_name: String,
     pub device_type: ShareTargetType,
+    /// Best address to connect to (on a subnet we share, if any).
     pub address: Ipv4Addr,
+    /// Every IPv4 the peer announced.
+    pub all_addresses: Vec<Ipv4Addr>,
     pub port: u16,
     pub tlv_records: HashMap<u8, Vec<u8>>,
 }
@@ -252,7 +341,10 @@ pub struct MdnsAdvertiser {
     daemon: ServiceDaemon,
     fullname: String,
     pub endpoint_id: [u8; 4],
+    /// Primary (default-route) address, also published in the `IPv4` TXT key.
     pub address: Ipv4Addr,
+    /// Every address announced (one A record per real interface).
+    pub addresses: Vec<Ipv4Addr>,
     pub port: u16,
 }
 
@@ -276,11 +368,20 @@ impl MdnsAdvertiser {
         ];
 
         let host_fqdn = format!("{hostname}.local.");
+        // A multi-homed PC (Ethernet + Wi-Fi + USB tether) must answer on each link with
+        // that link's own address: Android connects to the A record it resolved, and a
+        // phone on Wi-Fi cannot reach the wired subnet.
+        let lan: Vec<Ipv4Addr> = lan_interfaces().into_iter().map(|i| i.addr).collect();
+        let announced: Vec<IpAddr> = if lan.is_empty() {
+            vec![IpAddr::V4(address)]
+        } else {
+            lan.iter().copied().map(IpAddr::V4).collect()
+        };
         let service_info = ServiceInfo::new(
             SERVICE_TYPE,
             &instance_name,
             &host_fqdn,
-            IpAddr::V4(address),
+            &announced[..],
             port,
             &properties[..],
         )
@@ -288,6 +389,7 @@ impl MdnsAdvertiser {
 
         let fullname = service_info.get_fullname().to_string();
         let daemon = ServiceDaemon::new().map_err(|e| MdnsError::Daemon(e.to_string()))?;
+        restrict_daemon_to_lan(&daemon);
         daemon
             .register(service_info)
             .map_err(|e| MdnsError::Daemon(e.to_string()))?;
@@ -297,76 +399,137 @@ impl MdnsAdvertiser {
             fullname,
             endpoint_id,
             address,
+            addresses: if lan.is_empty() { vec![address] } else { lan },
             port,
         })
     }
 
+    /// Unregister and shut the mDNS daemon down (also happens automatically on drop).
     pub fn stop(self) {
+        drop(self);
+    }
+}
+
+impl Drop for MdnsAdvertiser {
+    fn drop(&mut self) {
         let _ = self.daemon.unregister(&self.fullname);
         let _ = self.daemon.shutdown();
     }
 }
 
-/// Browse `_FC9F5ED42C8A._tcp.local.` for `duration` and return discovered Quick Share receivers.
-pub async fn discover_devices(duration: Duration) -> Result<Vec<DiscoveredDevice>, MdnsError> {
+/// Live discovery event from [`watch_devices`].
+#[derive(Debug, Clone)]
+pub enum DiscoveryEvent {
+    /// A receiver appeared or its advertisement changed.
+    Found(DiscoveredDevice),
+    /// A receiver's advertisement expired or was withdrawn (`endpoint_id`).
+    Lost(String),
+}
+
+/// Browse continuously and stream `Found`/`Lost` events until the returned receiver is
+/// dropped. Our own advertisement is filtered out like in [`discover_devices`].
+pub fn watch_devices() -> Result<tokio::sync::mpsc::Receiver<DiscoveryEvent>, MdnsError> {
     let daemon = ServiceDaemon::new().map_err(|e| MdnsError::Daemon(e.to_string()))?;
+    restrict_daemon_to_lan(&daemon);
+    let browser = daemon
+        .browse(SERVICE_TYPE)
+        .map_err(|e| MdnsError::Daemon(e.to_string()))?;
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let own_id = stable_endpoint_id(&default_hostname());
+
+    tokio::spawn(async move {
+        loop {
+            let ev = match browser.recv_async().await {
+                Ok(ev) => ev,
+                Err(_) => break,
+            };
+            let out = match ev {
+                ServiceEvent::ServiceResolved(info) => {
+                    resolve_device(&info, Some(&own_id)).map(DiscoveryEvent::Found)
+                }
+                ServiceEvent::ServiceRemoved(_, fullname) => {
+                    let instance_name = fullname
+                        .strip_suffix(&format!(".{SERVICE_TYPE}"))
+                        .unwrap_or(&fullname);
+                    parse_service_instance_name(instance_name)
+                        .ok()
+                        .map(|(ep, _)| DiscoveryEvent::Lost(String::from_utf8_lossy(&ep).into_owned()))
+                }
+                _ => None,
+            };
+            if let Some(out) = out {
+                if tx.send(out).await.is_err() {
+                    break; // GUI went away
+                }
+            }
+        }
+        let _ = daemon.shutdown();
+    });
+    Ok(rx)
+}
+
+/// Turn a resolved mDNS record into a [`DiscoveredDevice`], skipping `skip_id` (our own
+/// endpoint) when given. Of the peer's A records, the one on a subnet we share wins.
+fn resolve_device(info: &mdns_sd::ServiceInfo, skip_id: Option<&[u8; 4]>) -> Option<DiscoveredDevice> {
+    let fullname = info.get_fullname();
+    let instance_name = fullname
+        .strip_suffix(&format!(".{SERVICE_TYPE}"))
+        .unwrap_or(fullname);
+    let (endpoint_id, _) = parse_service_instance_name(instance_name).ok()?;
+    if skip_id == Some(&endpoint_id) {
+        return None;
+    }
+    let txt_n = info.get_property_val_str(TXT_KEY_ENDPOINT_INFO)?;
+    let adv = parse_endpoint_info(&url64_decode(txt_n).ok()?).ok()?;
+    let mut all: Vec<Ipv4Addr> = info.get_addresses_v4().into_iter().copied().collect();
+    all.sort();
+    let address = prefer_reachable(all.iter().copied()).or_else(|| {
+        info.get_property_val_str(TXT_KEY_IPV4)
+            .and_then(|s| s.parse::<Ipv4Addr>().ok())
+    })?;
+    Some(DiscoveredDevice {
+        endpoint_id: String::from_utf8_lossy(&endpoint_id).into_owned(),
+        device_name: adv
+            .device_name
+            .unwrap_or_else(|| "(hidden Quick Share device)".to_string()),
+        device_type: adv.device_type,
+        address,
+        all_addresses: all,
+        port: info.get_port(),
+        tlv_records: adv.tlv_records,
+    })
+}
+
+/// Browse `_FC9F5ED42C8A._tcp.local.` for `duration` and return discovered Quick Share receivers.
+/// Skips our own advertisement (same hostname-derived endpoint ID) so the sender
+/// never offers to send to itself.
+pub async fn discover_devices(duration: Duration) -> Result<Vec<DiscoveredDevice>, MdnsError> {
+    discover_devices_with(duration, false).await
+}
+
+/// [`discover_devices`] with the option to include this host's own advertisement
+/// (`include_self`), useful to check what phones will actually see.
+pub async fn discover_devices_with(
+    duration: Duration,
+    include_self: bool,
+) -> Result<Vec<DiscoveredDevice>, MdnsError> {
+    let daemon = ServiceDaemon::new().map_err(|e| MdnsError::Daemon(e.to_string()))?;
+    restrict_daemon_to_lan(&daemon);
     let receiver = daemon
         .browse(SERVICE_TYPE)
         .map_err(|e| MdnsError::Daemon(e.to_string()))?;
 
-    let mut found: HashMap<[u8; 4], DiscoveredDevice> = HashMap::new();
+    let own_id = if include_self { None } else { Some(stable_endpoint_id(&default_hostname())) };
+    let mut found: HashMap<String, DiscoveredDevice> = HashMap::new();
     let deadline = tokio::time::Instant::now() + duration;
 
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining, receiver.recv_async()).await {
             Ok(Ok(ServiceEvent::ServiceResolved(info))) => {
-                let fullname = info.get_fullname();
-                let instance_name = fullname
-                    .strip_suffix(&format!(".{SERVICE_TYPE}"))
-                    .unwrap_or(fullname);
-
-                let Ok((endpoint_id, _)) = parse_service_instance_name(instance_name) else {
-                    continue;
-                };
-
-                let Some(txt_n) = info.get_property_val_str(TXT_KEY_ENDPOINT_INFO) else {
-                    continue;
-                };
-                let Ok(endpoint_bytes) = url64_decode(txt_n) else {
-                    continue;
-                };
-                let Ok(adv) = parse_endpoint_info(&endpoint_bytes) else {
-                    continue;
-                };
-
-                let ipv4 = info
-                    .get_addresses_v4()
-                    .into_iter()
-                    .copied()
-                    .find(|ip| !ip.is_loopback())
-                    .or_else(|| {
-                        info.get_property_val_str(TXT_KEY_IPV4)
-                            .and_then(|s| s.parse::<Ipv4Addr>().ok())
-                    });
-
-                let Some(address) = ipv4 else {
-                    continue;
-                };
-
-                found.insert(
-                    endpoint_id,
-                    DiscoveredDevice {
-                        endpoint_id: String::from_utf8_lossy(&endpoint_id).into_owned(),
-                        device_name: adv
-                            .device_name
-                            .unwrap_or_else(|| "(hidden Quick Share device)".to_string()),
-                        device_type: adv.device_type,
-                        address,
-                        port: info.get_port(),
-                        tlv_records: adv.tlv_records,
-                    },
-                );
+                if let Some(d) = resolve_device(&info, own_id.as_ref()) {
+                    found.insert(d.endpoint_id.clone(), d);
+                }
             }
             Ok(Ok(_)) => continue,
             _ => break,

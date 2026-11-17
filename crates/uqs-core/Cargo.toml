@@ -23,6 +23,7 @@ aes-gcm.workspace = true
 cbc.workspace = true
 p256.workspace = true
 mdns-sd.workspace = true
+if-addrs.workspace = true
 zbus.workspace = true
 qrcode.workspace = true
 serde.workspace = true

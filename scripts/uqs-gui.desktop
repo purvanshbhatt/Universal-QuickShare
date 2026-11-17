@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Quick Share
+GenericName=Universal Quick Share
+Comment=Send and receive files, links and text with Android, Windows and Linux devices nearby
+Exec=uqs-gui %F
+Icon=document-send
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+Keywords=quickshare;nearby;share;airdrop;transfer;
+StartupWMClass=uqs-gui
+MimeType=application/octet-stream;

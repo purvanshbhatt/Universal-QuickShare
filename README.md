@@ -14,11 +14,29 @@ shipped binaries and compatible with:
   (`PCPhoneCopy` / `copypaste_metadata`), SMS send/sync (`MESSAGES_SMS`), and call dialing
   (`DIAL_ON_PHONE`) over CDP `pbvalueset.ValueSet` on TCP port 5040.
 
-## Usage
+## Desktop app (`uqs-gui`)
+
+A tray app with a single window, built with iced (pure Rust, no GTK/Qt needed):
+
+- **Receive** is always on: an incoming share opens the window with the sender's name,
+  the item list and the 4-digit confirmation code; Accept/Decline. Files land in the
+  download folder, text and links go straight to your clipboard.
+- **Send** anything: drop files on the window, "Add files…", "Paste clipboard" (text, a
+  link, or files copied in Thunar), or type/paste text. Pick a nearby device, hit Send.
+- Second invocations hand off to the running instance: `uqs-gui photo.jpg`,
+  `uqs-gui --clipboard`, `uqs-gui --text "https://…"`. Thunar's "Send via Quick Share"
+  uses this.
+- Settings: device name, download folder, visibility, auto-accept, light/dark.
+
+`scripts/install.sh` installs the launcher, an autostart entry (tray at login) and the
+Thunar action, and retires the old headless `uqs.service`.
+
+## CLI usage
 
 ```bash
 uqs receive --qrcode            # receive files from your phone
 uqs send photo.jpg              # send to a nearby Quick Share device
+uqs send --text "https://…"     # send a link / text (also: --clipboard)
 uqs discover                    # list Quick Share + AirDrop devices on the LAN
 uqs airdrop-status              # check AWDL / monitor-mode support of your WiFi card
 uqs phonelink listen            # receive clipboard / SMS / call events (port 5040)

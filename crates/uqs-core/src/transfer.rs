@@ -1,6 +1,7 @@
 //! Quick Share file, text, and WiFi-credential receive & send session state machines.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -24,8 +25,9 @@ use uqs_proto::location::nearby::connections::{
 use uqs_proto::nearby::sharing::service::proto::{
     connection_response_frame as share_resp, file_metadata, frame as share_frame,
     paired_key_result_frame, v1_frame as share_v1, ConnectionResponseFrame as ShareConnResp,
-    FileMetadata, Frame as ShareFrame, IntroductionFrame, PairedKeyEncryptionFrame,
-    PairedKeyResultFrame, V1Frame as ShareV1Frame, WifiCredentials,
+    text_metadata, FileMetadata, Frame as ShareFrame, IntroductionFrame,
+    PairedKeyEncryptionFrame, PairedKeyResultFrame, TextMetadata, V1Frame as ShareV1Frame,
+    WifiCredentials,
 };
 
 use crate::d2d::{D2DError, SecureChannel};
@@ -93,6 +95,117 @@ pub struct OfferedText {
     pub payload_id: i64,
     pub title: String,
     pub size: u64,
+}
+
+/// `TextMetadata.Type` — tells the receiver how to present a text attachment
+/// (Android opens URLs in the browser, dials phone numbers, maps addresses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutgoingTextKind {
+    Text,
+    Url,
+    Address,
+    PhoneNumber,
+}
+
+impl OutgoingTextKind {
+    /// Guess the kind from the content: `http(s)://` → URL, digits/`+` only → phone number.
+    pub fn guess(body: &str) -> Self {
+        let t = body.trim();
+        let lower = t.to_ascii_lowercase();
+        if (lower.starts_with("http://") || lower.starts_with("https://"))
+            && !t.contains(char::is_whitespace)
+        {
+            return Self::Url;
+        }
+        let digits = t.chars().filter(|c| c.is_ascii_digit()).count();
+        if digits >= 7
+            && t.chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '(' | ')'))
+        {
+            return Self::PhoneNumber;
+        }
+        Self::Text
+    }
+
+    fn proto_type(self) -> i32 {
+        match self {
+            Self::Text => text_metadata::Type::Text as i32,
+            Self::Url => text_metadata::Type::Url as i32,
+            Self::Address => text_metadata::Type::Address as i32,
+            Self::PhoneNumber => text_metadata::Type::PhoneNumber as i32,
+        }
+    }
+}
+
+/// Something the local side wants to share: a file on disk or a text/URL snippet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OutgoingItem {
+    File(PathBuf),
+    Text {
+        kind: OutgoingTextKind,
+        /// Shown in the receiver's notification (`TextMetadata.text_title`).
+        title: String,
+        body: String,
+    },
+}
+
+impl OutgoingItem {
+    /// Build a text item, guessing the kind and deriving a short title from the body.
+    pub fn text(body: impl Into<String>) -> Self {
+        let body = body.into();
+        let kind = OutgoingTextKind::guess(&body);
+        let first_line = body.lines().next().unwrap_or("").trim();
+        let mut title: String = first_line.chars().take(60).collect();
+        if title.len() < first_line.len() {
+            title.push('…');
+        }
+        if title.is_empty() {
+            title = "Text".to_string();
+        }
+        Self::Text { kind, title, body }
+    }
+
+    /// Interpret clipboard text the way a share sheet would: `file://` URIs (what Thunar,
+    /// Nautilus and Dolphin put on the clipboard on Copy) become file items when they all
+    /// exist on disk; anything else becomes one text item. Empty clipboard → empty vec.
+    pub fn from_clipboard_text(clip: &str) -> Vec<Self> {
+        if clip.trim().is_empty() {
+            return Vec::new();
+        }
+        let lines: Vec<&str> = clip
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && *l != "copy" && *l != "cut")
+            .collect();
+        let uris: Vec<PathBuf> = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("file://").map(percent_decode_path))
+            .collect();
+        if !uris.is_empty() && uris.len() == lines.len() && uris.iter().all(|p| p.is_file()) {
+            uris.into_iter().map(Self::File).collect()
+        } else {
+            vec![Self::text(clip.to_string())]
+        }
+    }
+}
+
+/// Minimal `%XX` decoding for `file://` URIs (`%20` → space, etc.).
+fn percent_decode_path(s: &str) -> PathBuf {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    PathBuf::from(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// Sanitize an untrusted filename offered by a remote peer (prevents `../` and `..\` traversal).
@@ -163,12 +276,18 @@ pub fn build_transport_connection_response_accept() -> Vec<u8> {
 }
 
 pub fn build_keep_alive_frame() -> Vec<u8> {
+    build_keep_alive_frame_with_ack(false)
+}
+
+/// Nearby Connections answers every received `KEEP_ALIVE` with `ack=true`; a peer that
+/// stays silent for ~30 s is disconnected, so both sides must keep answering while idle.
+pub fn build_keep_alive_frame_with_ack(ack: bool) -> Vec<u8> {
     OfflineFrame {
         version: Some(offline_frame::Version::V1 as i32),
         v1: Some(OffV1Frame {
             r#type: Some(off_v1::FrameType::KeepAlive as i32),
             keep_alive: Some(KeepAliveFrame {
-                ack: Some(false),
+                ack: Some(ack),
                 seq_num: None,
             }),
             ..Default::default()
@@ -178,7 +297,13 @@ pub fn build_keep_alive_frame() -> Vec<u8> {
 }
 
 pub fn wrap_offline_bytes_payload(sharing_frame_bytes: &[u8]) -> [Vec<u8>; 2] {
-    let payload_id = next_positive_payload_id();
+    wrap_offline_bytes_payload_with_id(next_positive_payload_id(), sharing_frame_bytes)
+}
+
+/// Wrap raw bytes into a 2-frame BYTES payload (data chunk + LAST_CHUNK terminator) with a
+/// caller-chosen `payload_id`, so a `TextMetadata.payload_id` announced in the Introduction
+/// can be matched to the text body that follows.
+pub fn wrap_offline_bytes_payload_with_id(payload_id: i64, sharing_frame_bytes: &[u8]) -> [Vec<u8>; 2] {
     let total_size = sharing_frame_bytes.len() as i64;
 
     let data_frame = OfflineFrame {
@@ -338,13 +463,33 @@ struct ActiveFileReceive {
 }
 
 /// Handle a single incoming Quick Share TCP connection on the receiver side.
-pub async fn handle_incoming_connection<F>(
+///
+/// `confirm_offer` is awaited while the connection keeps answering the peer's `KEEP_ALIVE`
+/// frames, so a slow human Accept/Reject (seconds to minutes) no longer makes Android drop
+/// the connection. Blocking UI must be wrapped in `tokio::task::spawn_blocking` by the caller.
+pub async fn handle_incoming_connection<F, Fut>(
+    stream: &mut TcpStream,
+    output_dir: &Path,
+    confirm_offer: F,
+) -> Result<Vec<ReceivedItem>, TransferError>
+where
+    F: FnMut(TransferOffer) -> Fut,
+    Fut: Future<Output = bool>,
+{
+    handle_incoming_connection_with_progress(stream, output_dir, confirm_offer, |_, _| {}).await
+}
+
+/// Like [`handle_incoming_connection`], additionally reporting `(bytes_done, bytes_total)`
+/// after every received chunk once the offer is accepted.
+pub async fn handle_incoming_connection_with_progress<F, Fut>(
     stream: &mut TcpStream,
     output_dir: &Path,
     mut confirm_offer: F,
+    mut on_progress: impl FnMut(u64, u64),
 ) -> Result<Vec<ReceivedItem>, TransferError>
 where
-    F: FnMut(&TransferOffer) -> bool,
+    F: FnMut(TransferOffer) -> Fut,
+    Fut: Future<Output = bool>,
 {
     let first_bytes = recv_frame(stream).await?;
     let conn_req_frame = OfflineFrame::decode(first_bytes.as_slice())?;
@@ -394,6 +539,8 @@ where
     let mut pending_wifi: HashMap<i64, (String, i32)> = HashMap::new();
     let mut completed_items: Vec<ReceivedItem> = Vec::new();
     let mut offer_accepted = false;
+    let mut bytes_total: u64 = 0;
+    let mut bytes_done: u64 = 0;
 
     loop {
         let enc_bytes = match recv_frame(stream).await {
@@ -408,7 +555,7 @@ where
 
         match v1.r#type {
             x if x == Some(off_v1::FrameType::KeepAlive as i32) => {
-                let ka = channel.encrypt(&build_keep_alive_frame());
+                let ka = channel.encrypt(&build_keep_alive_frame_with_ack(true));
                 send_frame(stream, &ka).await?;
                 continue;
             }
@@ -450,6 +597,10 @@ where
             let buf = bytes_reassembly.entry(payload_id).or_default();
             if !body.is_empty() {
                 buf.extend_from_slice(&body);
+                if pending_texts.contains_key(&payload_id) {
+                    bytes_done += body.len() as u64;
+                    on_progress(bytes_done.min(bytes_total), bytes_total);
+                }
             }
             if is_last {
                 let full_bytes = bytes_reassembly.remove(&payload_id).unwrap_or_default();
@@ -529,10 +680,15 @@ where
                                         wifi_ssids,
                                     };
 
-                                    let accept = confirm_offer(&offer);
+                                    let accept =
+                                        await_offer_decision(stream, &mut channel, confirm_offer(offer))
+                                            .await?;
                                     offer_accepted = accept;
 
                                     if accept {
+                                        bytes_total = offered_files.iter().map(|f| f.size).sum::<u64>()
+                                            + offered_texts.iter().map(|t| t.size).sum::<u64>();
+                                        on_progress(0, bytes_total);
                                         for f in offered_files {
                                             let dest_path = unique_destination(output_dir, &f.name);
                                             let part_path = dest_path
@@ -588,6 +744,8 @@ where
                     af.file.seek(std::io::SeekFrom::Start(offset)).await?;
                     af.file.write_all(&body).await?;
                     af.bytes_written += body.len() as u64;
+                    bytes_done += body.len() as u64;
+                    on_progress(bytes_done.min(bytes_total), bytes_total);
                 }
                 if (is_last || af.bytes_written >= af.size) && !af.finalized {
                     af.file.flush().await?;
@@ -617,6 +775,71 @@ where
     }
 
     Ok(completed_items)
+}
+
+/// Await the user's Accept/Reject decision while servicing the peer's `KEEP_ALIVE`s.
+///
+/// Returns `Ok(false)` if the peer disconnects or cancels before the user answers.
+/// `TcpStream::peek()` is cancel-safe (MSG_PEEK consumes nothing) and, unlike `readable()`,
+/// only resolves when a byte really is queued, so the frame is then read whole outside the
+/// `select!` and no bytes are lost when the decision future wins the race.
+async fn await_offer_decision<Fut: Future<Output = bool>>(
+    stream: &mut TcpStream,
+    channel: &mut SecureChannel,
+    decision: Fut,
+) -> Result<bool, TransferError> {
+    let mut decision = Box::pin(decision);
+    let mut peek_buf = [0u8; 1];
+    loop {
+        tokio::select! {
+            answer = &mut decision => return Ok(answer),
+            peeked = stream.peek(&mut peek_buf) => {
+                if peeked? == 0 {
+                    return Ok(false); // peer went away while the user was deciding
+                }
+                let enc = match recv_frame(stream).await {
+                    Ok(b) => b,
+                    Err(FrameError::ConnectionClosedImmediately | FrameError::UnexpectedEof) => {
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(TransferError::Framing(e)),
+                };
+                if !pump_idle_frame(stream, channel, &enc).await? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+}
+
+/// Handle a frame received while waiting for something else. Answers `KEEP_ALIVE`,
+/// returns `Ok(false)` on `DISCONNECTION` / payload cancel, ignores anything else.
+async fn pump_idle_frame(
+    stream: &mut TcpStream,
+    channel: &mut SecureChannel,
+    enc: &[u8],
+) -> Result<bool, TransferError> {
+    let raw = channel.decrypt(enc)?;
+    let off = OfflineFrame::decode(raw.as_slice())?;
+    let Some(v1) = off.v1 else { return Ok(true) };
+    match v1.r#type {
+        t if t == Some(off_v1::FrameType::KeepAlive as i32) => {
+            let ka = channel.encrypt(&build_keep_alive_frame_with_ack(true));
+            send_frame(stream, &ka).await?;
+        }
+        t if t == Some(off_v1::FrameType::Disconnection as i32) => return Ok(false),
+        t if t == Some(off_v1::FrameType::PayloadTransfer as i32) => {
+            if let Some(ctrl) = v1.payload_transfer.and_then(|pt| pt.control_message) {
+                if ctrl.event == Some(control_message::EventType::PayloadCanceled as i32)
+                    || ctrl.event == Some(control_message::EventType::PayloadError as i32)
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(true)
 }
 
 fn guess_file_type_and_mime(path: &Path) -> (i32, String) {
@@ -649,7 +872,7 @@ fn guess_file_type_and_mime(path: &Path) -> (i32, String) {
 
 async fn recv_sharing_frame(
     stream: &mut TcpStream,
-    channel: &SecureChannel,
+    channel: &mut SecureChannel,
 ) -> Result<ShareFrame, TransferError> {
     let mut reassembly = Vec::new();
     loop {
@@ -657,6 +880,15 @@ async fn recv_sharing_frame(
         let raw = channel.decrypt(&enc)?;
         let off = OfflineFrame::decode(raw.as_slice())?;
         let Some(v1) = off.v1 else { continue };
+        if v1.r#type == Some(off_v1::FrameType::KeepAlive as i32) {
+            // The receiver's human may take a while to tap Accept; keep the link alive.
+            let ka = channel.encrypt(&build_keep_alive_frame_with_ack(true));
+            send_frame(stream, &ka).await?;
+            continue;
+        }
+        if v1.r#type == Some(off_v1::FrameType::Disconnection as i32) {
+            return Err(TransferError::DeclinedOrCanceled);
+        }
         if v1.r#type != Some(off_v1::FrameType::PayloadTransfer as i32) {
             continue;
         }
@@ -679,6 +911,7 @@ async fn recv_sharing_frame(
 }
 
 /// Connect to a Quick Share receiver at `target_addr` and send `files`.
+/// Thin wrapper over [`send_items_to_peer`] kept for existing callers.
 pub async fn send_files_to_peer<F>(
     target_addr: SocketAddr,
     sender_name: &str,
@@ -690,6 +923,52 @@ pub async fn send_files_to_peer<F>(
 where
     F: FnOnce(&[u8]) -> [u8; 64],
 {
+    let items: Vec<OutgoingItem> = files.iter().cloned().map(OutgoingItem::File).collect();
+    send_items_to_peer(target_addr, sender_name, endpoint_id, &items, qr_signature_fn, on_pin).await
+}
+
+/// Connect to a Quick Share receiver at `target_addr` and send `items` (files and/or
+/// text/URL snippets) in one session, exactly as the Android share sheet does.
+pub async fn send_items_to_peer<F>(
+    target_addr: SocketAddr,
+    sender_name: &str,
+    endpoint_id: &[u8; 4],
+    items: &[OutgoingItem],
+    qr_signature_fn: Option<F>,
+    on_pin: impl FnOnce(&str),
+) -> Result<(), TransferError>
+where
+    F: FnOnce(&[u8]) -> [u8; 64],
+{
+    send_items_to_peer_with_progress(
+        target_addr,
+        sender_name,
+        endpoint_id,
+        items,
+        qr_signature_fn,
+        on_pin,
+        |_, _| {},
+    )
+    .await
+}
+
+/// Like [`send_items_to_peer`], additionally reporting `(bytes_done, bytes_total)` after
+/// every chunk. `on_progress(0, total)` fires once the receiver accepts.
+pub async fn send_items_to_peer_with_progress<F>(
+    target_addr: SocketAddr,
+    sender_name: &str,
+    endpoint_id: &[u8; 4],
+    items: &[OutgoingItem],
+    qr_signature_fn: Option<F>,
+    on_pin: impl FnOnce(&str),
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<(), TransferError>
+where
+    F: FnOnce(&[u8]) -> [u8; 64],
+{
+    if items.is_empty() {
+        return Err(TransferError::Protocol("nothing to send"));
+    }
     let mut stream = TcpStream::connect(target_addr).await?;
     let endpoint_info =
         build_endpoint_info(Some(sender_name), ShareTargetType::Laptop).unwrap_or_default();
@@ -729,35 +1008,53 @@ where
         let enc = channel.encrypt(&raw);
         send_frame(&mut stream, &enc).await?;
     }
-    let _peer_pke = recv_sharing_frame(&mut stream, &channel).await?;
+    let _peer_pke = recv_sharing_frame(&mut stream, &mut channel).await?;
 
     for raw in build_paired_key_result_unable_frames() {
         let enc = channel.encrypt(&raw);
         send_frame(&mut stream, &enc).await?;
     }
-    let _peer_pkr = recv_sharing_frame(&mut stream, &channel).await?;
+    let _peer_pkr = recv_sharing_frame(&mut stream, &mut channel).await?;
 
-    let mut metas = Vec::with_capacity(files.len());
-    let mut payload_ids = Vec::with_capacity(files.len());
-    for (idx, path) in files.iter().enumerate() {
-        let meta = fs::metadata(path).await?;
+    let mut file_metas = Vec::new();
+    let mut text_metas = Vec::new();
+    // (path, payload_id) for files; (body, payload_id) for texts — sent in this order.
+    let mut file_payloads: Vec<(&PathBuf, i64)> = Vec::new();
+    let mut text_payloads: Vec<(&str, i64)> = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
         let pid = next_positive_payload_id();
-        payload_ids.push(pid);
-        let (ftype, mime) = guess_file_type_and_mime(path);
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file")
-            .to_string();
-        metas.push(FileMetadata {
-            name: Some(name),
-            r#type: Some(ftype),
-            payload_id: Some(pid),
-            size: Some(meta.len() as i64),
-            mime_type: Some(mime),
-            id: Some(idx as i64),
-            ..Default::default()
-        });
+        match item {
+            OutgoingItem::File(path) => {
+                let meta = fs::metadata(path).await?;
+                let (ftype, mime) = guess_file_type_and_mime(path);
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+                    .to_string();
+                file_metas.push(FileMetadata {
+                    name: Some(name),
+                    r#type: Some(ftype),
+                    payload_id: Some(pid),
+                    size: Some(meta.len() as i64),
+                    mime_type: Some(mime),
+                    id: Some(idx as i64),
+                    ..Default::default()
+                });
+                file_payloads.push((path, pid));
+            }
+            OutgoingItem::Text { kind, title, body } => {
+                text_metas.push(TextMetadata {
+                    text_title: Some(title.clone()),
+                    r#type: Some(kind.proto_type()),
+                    payload_id: Some(pid),
+                    size: Some(body.len() as i64),
+                    id: Some(idx as i64),
+                    is_sensitive_text: Some(false),
+                });
+                text_payloads.push((body.as_str(), pid));
+            }
+        }
     }
 
     let intro = ShareFrame {
@@ -765,7 +1062,8 @@ where
         v1: Some(ShareV1Frame {
             r#type: Some(share_v1::FrameType::Introduction as i32),
             introduction: Some(IntroductionFrame {
-                file_metadata: metas,
+                file_metadata: file_metas,
+                text_metadata: text_metas,
                 start_transfer: Some(true),
                 ..Default::default()
             }),
@@ -779,7 +1077,7 @@ where
         send_frame(&mut stream, &enc).await?;
     }
 
-    let resp = recv_sharing_frame(&mut stream, &channel).await?;
+    let resp = recv_sharing_frame(&mut stream, &mut channel).await?;
     let status = resp
         .v1
         .and_then(|v| v.connection_response)
@@ -788,7 +1086,27 @@ where
         return Err(TransferError::DeclinedOrCanceled);
     }
 
-    for (path, &payload_id) in files.iter().zip(payload_ids.iter()) {
+    let mut bytes_total: u64 = text_payloads.iter().map(|(b, _)| b.len() as u64).sum::<u64>();
+    for (path, _) in &file_payloads {
+        bytes_total += fs::metadata(path).await?.len();
+    }
+    let mut bytes_done: u64 = 0;
+    on_progress(0, bytes_total);
+
+    // Text bodies are plain BYTES payloads whose id matches the announced TextMetadata.
+    let mut last_payload_id = None;
+    for (body, payload_id) in &text_payloads {
+        for raw in wrap_offline_bytes_payload_with_id(*payload_id, body.as_bytes()) {
+            let enc = channel.encrypt(&raw);
+            send_frame(&mut stream, &enc).await?;
+        }
+        bytes_done += body.len() as u64;
+        on_progress(bytes_done, bytes_total);
+        last_payload_id = Some(*payload_id);
+    }
+
+    for (path, payload_id) in file_payloads {
+        last_payload_id = Some(payload_id);
         let total_size = fs::metadata(path).await?.len() as i64;
         let file_name = path
             .file_name()
@@ -837,14 +1155,16 @@ where
             let enc = channel.encrypt(&chunk_frame);
             send_frame(&mut stream, &enc).await?;
             offset += n as i64;
+            bytes_done += n as u64;
+            on_progress(bytes_done.min(bytes_total), bytes_total);
             if is_last {
                 break;
             }
         }
     }
 
-    if let Some(&last_pid) = payload_ids.last() {
-        wait_for_received_ack(&mut stream, &channel, last_pid).await;
+    if let Some(last_pid) = last_payload_id {
+        wait_for_received_ack(&mut stream, &mut channel, last_pid).await;
     }
 
     Ok(())
@@ -852,7 +1172,7 @@ where
 
 async fn wait_for_received_ack(
     stream: &mut TcpStream,
-    channel: &SecureChannel,
+    channel: &mut SecureChannel,
     expected_payload_id: i64,
 ) {
     while let Ok(enc) = recv_frame(stream).await {
@@ -863,6 +1183,16 @@ async fn wait_for_received_ack(
             break;
         };
         let Some(v1) = off.v1 else { continue };
+        if v1.r#type == Some(off_v1::FrameType::KeepAlive as i32) {
+            let ka = channel.encrypt(&build_keep_alive_frame_with_ack(true));
+            if send_frame(stream, &ka).await.is_err() {
+                break;
+            }
+            continue;
+        }
+        if v1.r#type == Some(off_v1::FrameType::Disconnection as i32) {
+            break;
+        }
         if v1.r#type != Some(off_v1::FrameType::PayloadTransfer as i32) {
             continue;
         }
