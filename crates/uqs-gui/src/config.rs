@@ -14,6 +14,9 @@ pub struct Config {
     pub auto_accept: bool,
     /// Advertise on the LAN / BLE so others can find this PC.
     pub visible: bool,
+    /// Also speak LocalSend (what iPhones use), on top of Quick Share.
+    #[serde(default = "yes")]
+    pub localsend: bool,
     /// `None` follows the desktop's light/dark mode.
     pub dark: Option<bool>,
 }
@@ -26,9 +29,14 @@ impl Default for Config {
             download_dir: home.join("Downloads"),
             auto_accept: false,
             visible: true,
+            localsend: true,
             dark: None,
         }
     }
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Config {

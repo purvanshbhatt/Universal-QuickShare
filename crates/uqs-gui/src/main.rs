@@ -8,6 +8,7 @@ mod app;
 mod config;
 mod icons;
 mod ipc;
+mod localsend;
 mod receiver;
 mod theme;
 mod tray;

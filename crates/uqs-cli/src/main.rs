@@ -16,6 +16,11 @@ use uqs_core::mdns::{
     MdnsAdvertiser, ShareTargetType,
 };
 use uqs_core::qrcode_flow::QuickShareQrCode;
+use uqs_localsend::{
+    client as ls_client, Discovery as LsDiscovery, DiscoveryConfig as LsDiscoveryConfig, Hooks as LsHooks,
+    Identity as LsIdentity, Peer as LsPeer, ReceiveEvent as LsReceiveEvent, Server as LsServer,
+    ServerConfig as LsServerConfig,
+};
 use uqs_core::transfer::{
     handle_incoming_connection, send_items_to_peer, OutgoingItem, ReceivedItem, TransferError,
     TransferOffer,
@@ -31,7 +36,7 @@ use uqs_phonelink::{
 #[command(
     name = "uqs",
     version,
-    about = "Universal Quick Share — Android Quick Share, Apple AirDrop & Microsoft Link to Windows for Linux"
+    about = "Universal Quick Share — Android Quick Share, LocalSend (iPhone), Apple AirDrop & Microsoft Link to Windows for Linux"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -124,6 +129,103 @@ enum Commands {
         #[command(subcommand)]
         action: PhoneLinkAction,
     },
+    /// LocalSend protocol v2 (what iPhones use): discover devices, send, receive
+    Localsend {
+        #[command(subcommand)]
+        action: LocalSendAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum LocalSendAction {
+    /// List LocalSend devices on the LAN
+    Discover {
+        /// Seconds to listen for answers
+        #[arg(long, default_value_t = 5)]
+        timeout: u64,
+        /// Name announced while discovering
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// Send files and/or text to a LocalSend device (iPhone, Android, Windows, macOS…)
+    Send {
+        /// Direct target `ip[:port]` (default port 53317), skipping discovery
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Device name (alias) to send to when several are found
+        #[arg(long)]
+        to: Option<String>,
+        /// Sender name shown on the receiving device
+        #[arg(short, long)]
+        name: Option<String>,
+        /// Discovery timeout in seconds
+        #[arg(long, default_value_t = 5)]
+        timeout: u64,
+        /// PIN, if the receiver requires one
+        #[arg(long)]
+        pin: Option<String>,
+        /// Text or URL to share (shown as a message on the receiver)
+        #[arg(long)]
+        text: Option<String>,
+        /// Share whatever is on the clipboard (text, a link, or files copied in the file manager)
+        #[arg(long)]
+        clipboard: bool,
+        /// Files to send
+        files: Vec<PathBuf>,
+    },
+    /// Receive LocalSend shares: files go to the output folder, text to the clipboard
+    Receive {
+        /// Device name shown in the sender's list
+        #[arg(short, long)]
+        name: Option<String>,
+        /// Output directory for received files
+        #[arg(short, long, default_value = "./downloads")]
+        output: PathBuf,
+        /// Accept every incoming share without prompting
+        #[arg(short, long)]
+        auto_accept: bool,
+    },
+}
+
+/// Our LocalSend identity plus a server; peers answer our multicast announcement by
+/// POSTing to that server's `/register`, so discovery without it misses most of them.
+/// `port` 0 lets this coexist with a running `uqs-gui` on 53317.
+async fn localsend_stack(name: &str, output: PathBuf, hooks: LsHooks, port: u16) -> Result<(LsServer, LsDiscovery)> {
+    let identity = LsIdentity::load_or_create(&uqs_localsend::cert::default_dir())?;
+    let mut cfg = LsServerConfig::new(name, identity, output, hooks);
+    cfg.bind = SocketAddr::from(([0, 0, 0, 0], port));
+    let server = LsServer::start(cfg)
+        .await
+        .context("LocalSend server could not start (is uqs-gui already listening on 53317?)")?;
+    let discovery = LsDiscovery::start(LsDiscoveryConfig::new(server.info.clone()), server.book.clone())?;
+    Ok((server, discovery))
+}
+
+/// Hooks that decline every incoming share (discover / send only need the server for `/register`).
+fn localsend_decline_hooks() -> LsHooks {
+    let (tx, _rx) = tokio::sync::mpsc::channel(1); // receiver dropped → every offer is declined
+    LsHooks::channel(tx)
+}
+
+fn parse_localsend_target(t: &str) -> Result<(std::net::IpAddr, u16)> {
+    if let Ok(sa) = t.parse::<SocketAddr>() {
+        return Ok((sa.ip(), sa.port()));
+    }
+    let ip = t.parse::<std::net::IpAddr>().with_context(|| format!("not an address: {t}"))?;
+    Ok((ip, uqs_localsend::DEFAULT_PORT))
+}
+
+fn print_localsend_peer(p: &LsPeer) {
+    println!(
+        "  - {} ({:?}{}) -> {}://{}:{}  fingerprint {}",
+        p.alias,
+        p.device_type,
+        p.device_model.as_deref().map(|m| format!(", {m}")).unwrap_or_default(),
+        p.protocol.scheme(),
+        p.ip,
+        p.port,
+        p.fingerprint
+    );
 }
 
 #[derive(Subcommand)]
@@ -709,6 +811,137 @@ async fn main() -> Result<()> {
                 let vs = build_dial_call_valueset(&number, "uqs.call.1");
                 send_phonelink_valueset(target, &vs).await?;
                 eprintln!("Sent DIAL_ON_PHONE request ({number}) to {target}.");
+            }
+        },
+
+        Commands::Localsend { action } => match action {
+            LocalSendAction::Discover { timeout, name } => {
+                let name = name.unwrap_or_else(default_hostname);
+                let (server, discovery) = localsend_stack(&name, PathBuf::from("."), localsend_decline_hooks(), 0).await?;
+                let lan = uqs_core::mdns::lan_interfaces();
+                println!(
+                    "Announcing as {:?} (fingerprint {}) on {}",
+                    name,
+                    server.info.fingerprint,
+                    lan.iter().map(|i| format!("{} {}", i.name, i.addr)).collect::<Vec<_>>().join(", ")
+                );
+                tokio::time::sleep(Duration::from_secs(timeout)).await;
+                let peers = discovery.peers();
+                println!("LocalSend devices ({}):", peers.len());
+                for p in &peers {
+                    print_localsend_peer(p);
+                }
+            }
+
+            LocalSendAction::Send { target, to, name, timeout, pin, text, clipboard, files } => {
+                let items = collect_outgoing(&files, text, clipboard)?;
+                let name = name.unwrap_or_else(default_hostname);
+                let (server, discovery) = localsend_stack(&name, PathBuf::from("."), localsend_decline_hooks(), 0).await?;
+                let peer = match target {
+                    Some(t) => {
+                        let (ip, port) = parse_localsend_target(&t)?;
+                        ls_client::probe_addr(ip, port, uqs_localsend::Protocol::Https, &server.info)
+                            .await
+                            .with_context(|| format!("no LocalSend device answered at {ip}:{port}"))?
+                    }
+                    None => {
+                        eprintln!("Looking for LocalSend devices ({timeout}s)…");
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
+                        let want = to.as_deref().map(str::to_lowercase);
+                        loop {
+                            let peers = discovery.peers();
+                            if let Some(w) = &want {
+                                if let Some(p) = peers.iter().find(|p| p.alias.to_lowercase() == *w) {
+                                    break p.clone();
+                                }
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                match (want, peers.len()) {
+                                    (Some(w), _) => {
+                                        for p in &peers {
+                                            print_localsend_peer(p);
+                                        }
+                                        bail!("no device named {w:?} found");
+                                    }
+                                    (None, 0) => bail!("no LocalSend devices found (is the LocalSend app open on the phone?)"),
+                                    (None, 1) => break peers[0].clone(),
+                                    (None, _) => {
+                                        for p in &peers {
+                                            print_localsend_peer(p);
+                                        }
+                                        bail!("several devices found; pick one with --to <name>");
+                                    }
+                                }
+                            }
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                    }
+                };
+                eprintln!("Sending {} to {} ({})… accept it on the device.", describe_items(&items), peer.alias, peer.ip);
+                let mut last_pct = u64::MAX;
+                ls_client::send_items(&peer, &server.info, &items, pin.as_deref(), move |done, total| {
+                    let pct = if total == 0 { 100 } else { done * 100 / total };
+                    if pct != last_pct {
+                        last_pct = pct;
+                        eprint!("\r{pct:>3}% ({done}/{total} bytes)");
+                    }
+                })
+                .await?;
+                eprintln!("\nSent {} to {}.", describe_items(&items), peer.alias);
+            }
+
+            LocalSendAction::Receive { name, output, auto_accept } => {
+                let name = name.unwrap_or_else(default_hostname);
+                let output = shellexpand_output(&output);
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<LsReceiveEvent>(64);
+                let (server, _discovery) =
+                    localsend_stack(&name, output.clone(), LsHooks::channel(tx), uqs_localsend::DEFAULT_PORT).await?;
+                eprintln!(
+                    "LocalSend receiver listening as {:?} on https://0.0.0.0:{} (fingerprint {}); files → {}",
+                    name,
+                    server.local_addr.port(),
+                    server.info.fingerprint,
+                    output.display()
+                );
+                loop {
+                    tokio::select! {
+                        ev = rx.recv() => match ev {
+                            Some(LsReceiveEvent::Offer { offer, reply, .. }) => {
+                                tokio::spawn(async move {
+                                    let accept = tokio::task::spawn_blocking(move || prompt_offer(&offer, auto_accept))
+                                        .await
+                                        .unwrap_or(false);
+                                    let _ = reply.send(accept);
+                                });
+                            }
+                            Some(LsReceiveEvent::Progress { .. }) => {}
+                            Some(LsReceiveEvent::Done { items, .. }) => {
+                                for item in items {
+                                    match item {
+                                        ReceivedItem::File { name, path, size } => {
+                                            eprintln!("Received {name} ({size} bytes) → {}", path.display());
+                                            notify_desktop("LocalSend", &format!("Received {name}"));
+                                        }
+                                        ReceivedItem::Text { title, body } => {
+                                            match write_linux_clipboard_text(&body) {
+                                                Ok(()) => eprintln!("Received text {title:?} → clipboard"),
+                                                Err(e) => eprintln!("Received text {title:?} (clipboard failed: {e}):\n{body}"),
+                                            }
+                                            notify_desktop("LocalSend", &format!("Copied to clipboard: {title}"));
+                                        }
+                                        ReceivedItem::WifiCredentials { ssid, .. } => eprintln!("Received Wi-Fi {ssid}"),
+                                    }
+                                }
+                            }
+                            Some(LsReceiveEvent::Failed { peer, error, .. }) => eprintln!("Transfer from {peer} failed: {error}"),
+                            None => break,
+                        },
+                        _ = tokio::signal::ctrl_c() => {
+                            eprintln!("\nShutting down LocalSend receiver...");
+                            break;
+                        }
+                    }
+                }
             }
         },
     }

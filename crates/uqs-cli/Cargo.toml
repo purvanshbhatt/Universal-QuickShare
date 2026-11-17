@@ -13,6 +13,7 @@ uqs-proto = { path = "../uqs-proto" }
 uqs-core = { path = "../uqs-core" }
 uqs-airdrop = { path = "../uqs-airdrop" }
 uqs-phonelink = { path = "../uqs-phonelink" }
+uqs-localsend = { path = "../uqs-localsend" }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

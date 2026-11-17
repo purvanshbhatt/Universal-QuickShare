@@ -18,11 +18,13 @@ use uqs_core::mdns::{stable_endpoint_id, DiscoveredDevice, DiscoveryEvent, Share
 use uqs_core::transfer::{
     send_items_to_peer_with_progress, OutgoingItem, OutgoingTextKind, ReceivedItem, TransferOffer,
 };
+use uqs_localsend::{DeviceInfo as LsDeviceInfo, DeviceType as LsDeviceType, Peer as LsPeer};
 use uqs_phonelink::{read_linux_clipboard_text, write_linux_clipboard_text};
 
 use crate::config::Config;
 use crate::icons;
 use crate::ipc;
+use crate::localsend::{self, LocalSendConfig, LocalSendEvent};
 use crate::receiver::{self, ReceiverConfig, ReceiverEvent, Reply};
 use crate::theme::{self as tk, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS};
 use crate::tray::{self, TrayCommand};
@@ -90,6 +92,68 @@ struct HistoryEntry {
     text: Option<String>,
 }
 
+/// One row of "Nearby devices": a Quick Share endpoint or a LocalSend peer.
+#[derive(Debug, Clone)]
+enum Nearby {
+    QuickShare(DiscoveredDevice),
+    LocalSend(LsPeer),
+}
+
+impl Nearby {
+    /// Stable key across both protocols (prefixed so the two id spaces cannot collide).
+    fn id(&self) -> String {
+        match self {
+            Nearby::QuickShare(d) => format!("qs:{}", d.endpoint_id),
+            Nearby::LocalSend(p) => format!("ls:{}", p.fingerprint),
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Nearby::QuickShare(d) => &d.device_name,
+            Nearby::LocalSend(p) => &p.alias,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Nearby::QuickShare(d) => match d.device_type {
+                ShareTargetType::Phone | ShareTargetType::Foldable => "Phone",
+                ShareTargetType::Tablet => "Tablet",
+                ShareTargetType::Laptop => "Computer",
+                ShareTargetType::Car => "Car",
+                ShareTargetType::Xr => "Headset",
+                ShareTargetType::Unknown => "Device",
+            },
+            Nearby::LocalSend(p) => match p.device_type {
+                LsDeviceType::Mobile => "Phone",
+                LsDeviceType::Desktop => "Computer",
+                LsDeviceType::Web => "Browser",
+                LsDeviceType::Headless | LsDeviceType::Server => "Server",
+            },
+        }
+    }
+
+    /// Second line of the row: kind, protocol (LocalSend only), address.
+    fn caption(&self) -> String {
+        match self {
+            Nearby::QuickShare(d) => format!("{} · {}", self.kind(), d.address),
+            Nearby::LocalSend(p) => format!("{} · LocalSend · {}", self.kind(), p.ip),
+        }
+    }
+
+    fn icon(&self) -> svg::Handle {
+        match self {
+            Nearby::QuickShare(d) => device_icon(d.device_type),
+            Nearby::LocalSend(p) => match p.device_type {
+                LsDeviceType::Mobile => icons::phone(),
+                LsDeviceType::Desktop => icons::laptop(),
+                _ => icons::device(),
+            },
+        }
+    }
+}
+
 /// `BleTriggerHandle` has no `Debug`; messages need one.
 pub struct Ble(#[allow(dead_code)] BleTriggerHandle);
 
@@ -110,8 +174,11 @@ pub struct State {
     theme_dark: Theme,
     _ble: Option<Arc<Ble>>,
 
-    devices: Vec<DiscoveredDevice>,
+    devices: Vec<Nearby>,
     selected: Option<String>,
+    /// Our LocalSend identity while its server is up (used as the sender's `info`).
+    localsend_info: Option<LsDeviceInfo>,
+    localsend_detail: String,
 
     outgoing: Vec<OutgoingItem>,
     draft: String,
@@ -148,6 +215,7 @@ pub enum Message {
 
     Discovery(DiscoveryEvent),
     Receiver(ReceiverEvent),
+    LocalSend(LocalSendEvent),
     Ipc(ipc::Command),
     Tray(TrayCommand),
 
@@ -182,6 +250,7 @@ pub enum Message {
     DownloadDirPicked(Option<PathBuf>),
     SetVisible(bool),
     SetAutoAccept(bool),
+    SetLocalSend(bool),
     SetAppearance(&'static str),
     SaveSettings,
 }
@@ -200,6 +269,8 @@ impl State {
             _ble: None,
             devices: Vec::new(),
             selected: None,
+            localsend_info: None,
+            localsend_detail: "LocalSend starting…".into(),
             outgoing: Vec::new(),
             draft: String::new(),
             hovering_drop: false,
@@ -245,6 +316,7 @@ impl State {
         Subscription::batch([
             Subscription::run(discovery_stream).map(Message::Discovery),
             Subscription::run_with(receiver_config(&self.config), receiver_stream).map(Message::Receiver),
+            Subscription::run_with(localsend_config(&self.config), localsend_stream).map(Message::LocalSend),
             Subscription::run(ipc::listen).map(Message::Ipc),
             Subscription::run(tray::run).map(Message::Tray),
             iced::system::theme_changes().map(Message::SystemTheme),
@@ -346,26 +418,36 @@ impl State {
             }
 
             Message::Discovery(DiscoveryEvent::Found(d)) => {
-                if let Some(existing) = self.devices.iter_mut().find(|x| x.endpoint_id == d.endpoint_id) {
-                    *existing = d;
-                } else {
-                    self.devices.push(d);
-                }
-                self.devices.sort_by(|a, b| a.device_name.to_lowercase().cmp(&b.device_name.to_lowercase()));
-                if self.selected.is_none() && self.devices.len() == 1 {
-                    self.selected = Some(self.devices[0].endpoint_id.clone());
-                }
+                self.upsert_device(Nearby::QuickShare(d));
                 Task::none()
             }
             Message::Discovery(DiscoveryEvent::Lost(id)) => {
-                self.devices.retain(|d| d.endpoint_id != id);
-                if self.selected.as_deref() == Some(id.as_str()) {
-                    self.selected = None;
-                }
+                self.remove_device(&format!("qs:{id}"));
                 Task::none()
             }
 
             Message::Receiver(ev) => self.on_receiver(ev),
+            Message::LocalSend(LocalSendEvent::Ready { info, detail }) => {
+                if info.is_none() {
+                    // Server gone: its peers are unreachable through us until it is back.
+                    self.devices.retain(|d| !matches!(d, Nearby::LocalSend(_)));
+                    if self.selected.as_deref().is_some_and(|s| s.starts_with("ls:")) {
+                        self.selected = None;
+                    }
+                }
+                self.localsend_info = info;
+                self.localsend_detail = detail;
+                Task::none()
+            }
+            Message::LocalSend(LocalSendEvent::Receiver(ev)) => self.on_receiver(ev),
+            Message::LocalSend(LocalSendEvent::Found(p)) => {
+                self.upsert_device(Nearby::LocalSend(p));
+                Task::none()
+            }
+            Message::LocalSend(LocalSendEvent::Lost(fp)) => {
+                self.remove_device(&format!("ls:{fp}"));
+                Task::none()
+            }
 
             Message::Ipc(ipc::Command::Ping) => Task::none(),
             Message::Ipc(ipc::Command::Show) | Message::Tray(TrayCommand::Show) => self.open_window(),
@@ -467,12 +549,22 @@ impl State {
                 if self.outgoing.is_empty() {
                     return Task::none();
                 }
-                let addr = SocketAddr::from((dev.address, dev.port));
-                self.send = SendState::Connecting { device: dev.device_name.clone() };
+                self.send = SendState::Connecting { device: dev.name().to_string() };
                 let items = self.outgoing.clone();
                 let name = self.config.device_name.clone();
-                let endpoint = stable_endpoint_id(&uqs_core::mdns::default_hostname());
-                Task::stream(send_stream(addr, name, endpoint, items)).map(Message::SendEvent)
+                match dev {
+                    Nearby::QuickShare(dev) => {
+                        let addr = SocketAddr::from((dev.address, dev.port));
+                        let endpoint = stable_endpoint_id(&uqs_core::mdns::default_hostname());
+                        Task::stream(send_stream(addr, name, endpoint, items)).map(Message::SendEvent)
+                    }
+                    Nearby::LocalSend(peer) => {
+                        let local = self.localsend_info.clone().unwrap_or_else(|| {
+                            LsDeviceInfo::new(name, String::new(), uqs_localsend::DEFAULT_PORT, uqs_localsend::Protocol::Https)
+                        });
+                        Task::stream(localsend_send_stream(peer, local, items)).map(Message::SendEvent)
+                    }
+                }
             }
             Message::SendEvent(ev) => {
                 let device = match &self.send {
@@ -588,6 +680,10 @@ impl State {
                 self.settings_draft.auto_accept = v;
                 Task::none()
             }
+            Message::SetLocalSend(v) => {
+                self.settings_draft.localsend = v;
+                Task::none()
+            }
             Message::SetAppearance(a) => {
                 self.settings_draft.dark = match a {
                     "Light" => Some(false),
@@ -632,7 +728,11 @@ impl State {
                     self.attention(),
                     notify(
                         &format!("{} wants to share", offer.peer_name),
-                        &format!("{} · PIN {}", describe_offer(&offer), offer.pin),
+                        &if offer.pin.is_empty() {
+                            describe_offer(&offer)
+                        } else {
+                            format!("{} · PIN {}", describe_offer(&offer), offer.pin)
+                        },
                     ),
                 ])
             }
@@ -702,9 +802,29 @@ impl State {
         }
     }
 
-    fn selected_device(&self) -> Option<&DiscoveredDevice> {
+    fn selected_device(&self) -> Option<&Nearby> {
         let id = self.selected.as_deref()?;
-        self.devices.iter().find(|d| d.endpoint_id == id)
+        self.devices.iter().find(|d| d.id() == id)
+    }
+
+    fn upsert_device(&mut self, d: Nearby) {
+        let id = d.id();
+        if let Some(existing) = self.devices.iter_mut().find(|x| x.id() == id) {
+            *existing = d;
+        } else {
+            self.devices.push(d);
+        }
+        self.devices.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
+        if self.selected.is_none() && self.devices.len() == 1 {
+            self.selected = Some(id);
+        }
+    }
+
+    fn remove_device(&mut self, id: &str) {
+        self.devices.retain(|d| d.id() != id);
+        if self.selected.as_deref() == Some(id) {
+            self.selected = None;
+        }
     }
 
     // --- view -------------------------------------------------------------------------
@@ -740,6 +860,22 @@ impl State {
                 move |t| tk::pill(t, on)
             })
             .padding([SPACE_XS, SPACE_MD]);
+        let ls_pill: Element<'_, Message> = if self.config.localsend {
+            container(text(&self.localsend_detail).size(tk::TEXT_CAPTION))
+                .style({
+                    let on = self.localsend_info.is_some() && self.config.visible;
+                    move |t| tk::pill(t, on)
+                })
+                .padding([SPACE_XS, SPACE_MD])
+                .into()
+        } else {
+            space::horizontal().width(0).into()
+        };
+        let subtitle = if self.config.localsend {
+            "Android · iPhone · Windows · Linux, over your Wi-Fi"
+        } else {
+            "Android · Windows · Linux, over your Wi-Fi"
+        };
         let settings_btn = match self.screen {
             Screen::Main => button(icon(icons::gear(), 18, false)).style(tk::quiet).padding(SPACE_SM).on_press(Message::OpenSettings),
             Screen::Settings => button(icon(icons::back(), 18, false)).style(tk::quiet).padding(SPACE_SM).on_press(Message::CloseSettings),
@@ -748,10 +884,11 @@ impl State {
             icon(icons::mark(), 30, true),
             column![
                 text("Quick Share").size(tk::TEXT_DISPLAY),
-                text("Android · Windows · Linux, over your Wi-Fi").size(tk::TEXT_CAPTION).style(muted),
+                text(subtitle).size(tk::TEXT_CAPTION).style(muted),
             ]
             .spacing(2),
             space::horizontal(),
+            ls_pill,
             pill,
             settings_btn,
         ]
@@ -837,27 +974,21 @@ impl State {
         // devices
         let mut device_list = column![].spacing(SPACE_XS);
         if self.devices.is_empty() {
-            device_list = device_list.push(
-                text("No devices yet. On the phone, open Quick Share (or its share sheet) so it becomes visible.")
-                    .size(tk::TEXT_CAPTION)
-                    .style(muted),
-            );
+            let hint = if self.config.localsend {
+                "No devices yet. Android: open Quick Share (or its share sheet) so the phone becomes visible. iPhone: open the LocalSend app."
+            } else {
+                "No devices yet. On the phone, open Quick Share (or its share sheet) so it becomes visible."
+            };
+            device_list = device_list.push(text(hint).size(tk::TEXT_CAPTION).style(muted));
         }
         for d in &self.devices {
-            let selected = self.selected.as_deref() == Some(d.endpoint_id.as_str());
-            let kind = match d.device_type {
-                ShareTargetType::Phone | ShareTargetType::Foldable => "Phone",
-                ShareTargetType::Tablet => "Tablet",
-                ShareTargetType::Laptop => "Computer",
-                ShareTargetType::Car => "Car",
-                ShareTargetType::Xr => "Headset",
-                ShareTargetType::Unknown => "Device",
-            };
+            let id = d.id();
+            let selected = self.selected.as_deref() == Some(id.as_str());
             let row_content = row![
-                icon(device_icon(d.device_type), 20, selected),
+                icon(d.icon(), 20, selected),
                 column![
-                    text(&d.device_name).size(tk::TEXT_BODY),
-                    text(format!("{kind} · {}", d.address)).size(tk::TEXT_CAPTION).style(muted),
+                    text(d.name()).size(tk::TEXT_BODY),
+                    text(d.caption()).size(tk::TEXT_CAPTION).style(muted),
                 ]
                 .spacing(1)
                 .width(Fill),
@@ -869,7 +1000,7 @@ impl State {
                 .style(tk::row_button)
                 .padding([SPACE_SM, SPACE_MD])
                 .width(Fill)
-                .on_press(Message::SelectDevice(d.endpoint_id.clone()));
+                .on_press(Message::SelectDevice(id));
             let wrapped: Element<'_, Message> = if selected {
                 container(btn).style(tk::selected_row).width(Fill).into()
             } else {
@@ -882,7 +1013,7 @@ impl State {
             && self.selected_device().is_some()
             && !matches!(self.send, SendState::Connecting { .. } | SendState::Waiting { .. } | SendState::Sending { .. });
         let send_label = match self.selected_device() {
-            Some(d) if !self.outgoing.is_empty() => format!("Send {} to {}", describe_items(&self.outgoing), d.device_name),
+            Some(d) if !self.outgoing.is_empty() => format!("Send {} to {}", describe_items(&self.outgoing), d.name()),
             Some(_) => "Add something to send".to_string(),
             None => "Pick a device".to_string(),
         };
@@ -1016,12 +1147,18 @@ impl State {
                     text(format!("{} wants to share", o.peer_name)).size(tk::TEXT_TITLE),
                     text(describe_offer(o)).size(tk::TEXT_CAPTION).style(muted),
                     lines,
-                    row![
-                        pin_row(&o.pin),
-                        text("Same code on the phone?").size(tk::TEXT_CAPTION).style(muted),
-                    ]
-                    .spacing(SPACE_MD)
-                    .align_y(iced::Center),
+                    if o.pin.is_empty() {
+                        // LocalSend has no confirmation code; the sender's name is the check.
+                        Element::from(space::vertical().height(0))
+                    } else {
+                        row![
+                            pin_row(&o.pin),
+                            text("Same code on the phone?").size(tk::TEXT_CAPTION).style(muted),
+                        ]
+                        .spacing(SPACE_MD)
+                        .align_y(iced::Center)
+                        .into()
+                    },
                     row![
                         space::horizontal(),
                         button(text("Decline").size(tk::TEXT_BODY)).style(tk::danger).padding([SPACE_SM, SPACE_MD]).on_press(Message::Decline(p.id)),
@@ -1160,6 +1297,10 @@ impl State {
             text("Anyone on your Wi-Fi who can see this PC could then drop files on it. Keep off on shared networks.")
                 .size(tk::TEXT_CAPTION)
                 .style(muted),
+            toggler(d.localsend).label("Also accept LocalSend (iPhone) shares").size(20).on_toggle(Message::SetLocalSend),
+            text("Speaks the LocalSend protocol on port 53317. iPhones, and any device with the LocalSend app, can then send here and receive from here.")
+                .size(tk::TEXT_CAPTION)
+                .style(muted),
             field(
                 "Appearance",
                 "",
@@ -1208,6 +1349,9 @@ fn icon<'a>(handle: svg::Handle, size: u16, accent: bool) -> Element<'a, Message
 }
 
 fn pin_row(pin: &str) -> Element<'_, Message> {
+    if pin.is_empty() {
+        return space::horizontal().width(0).into();
+    }
     text(pin).size(tk::TEXT_PIN).font(Font::MONOSPACE).into()
 }
 
@@ -1300,6 +1444,38 @@ fn receiver_config(c: &Config) -> ReceiverConfig {
 
 fn receiver_stream(cfg: &ReceiverConfig) -> impl Stream<Item = ReceiverEvent> {
     receiver::run(cfg.clone())
+}
+
+fn localsend_config(c: &Config) -> LocalSendConfig {
+    LocalSendConfig {
+        device_name: c.device_name.clone(),
+        download_dir: c.download_dir.clone(),
+        visible: c.visible,
+        enabled: c.localsend,
+    }
+}
+
+fn localsend_stream(cfg: &LocalSendConfig) -> impl Stream<Item = LocalSendEvent> {
+    localsend::run(cfg.clone())
+}
+
+/// LocalSend has no confirmation code: the empty `Pin` just switches the status line to
+/// "Waiting for … to accept" while the other side looks at its dialog.
+fn localsend_send_stream(peer: LsPeer, local: LsDeviceInfo, items: Vec<OutgoingItem>) -> impl Stream<Item = SendEvent> {
+    iced::stream::channel(256, async move |mut out: Sender<SendEvent>| {
+        let _ = out.send(SendEvent::Pin(String::new())).await;
+        let mut prog_tx = out.clone();
+        let res = uqs_localsend::send_items(&peer, &local, &items, None, move |done, total| {
+            let _ = prog_tx.try_send(SendEvent::Progress(done, total));
+        })
+        .await;
+        let _ = out
+            .send(match res {
+                Ok(()) => SendEvent::Done,
+                Err(e) => SendEvent::Failed(e.to_string()),
+            })
+            .await;
+    })
 }
 
 fn discovery_stream() -> impl Stream<Item = DiscoveryEvent> {
